@@ -1,12 +1,14 @@
-use std::ops::{Add, Sub};
-use std::time::{Duration, SystemTime};
 use std::default::Default;
+use std::ops::{Add, Sub};
 use std::thread;
-use redis;
+use std::time::{Duration, SystemTime};
+
 use rand::{thread_rng, Rng};
-use scripts::{LOCK, UNLOCK, EXTEND};
-use errors::{RedlockResult, RedlockError};
-use util;
+use redis;
+
+use crate::errors::*;
+use crate::scripts::{EXTEND, LOCK, UNLOCK};
+use crate::util;
 
 #[derive(Debug)]
 enum RequestInfo<'a> {
@@ -41,7 +43,8 @@ impl<'a> Lock<'a> {
 
 // Configuration of Redlock
 pub struct Config<T>
-    where T: redis::IntoConnectionInfo
+where
+    T: redis::IntoConnectionInfo,
 {
     pub addrs: Vec<T>,
     pub retry_count: u32,
@@ -52,8 +55,14 @@ pub struct Config<T>
 
 impl Default for Config<&'static str> {
     fn default() -> Self {
-        Config {
-            addrs: vec!["redis://127.0.0.1"],
+        Self::with_defaults(vec!["redis://127.0.0.1"])
+    }
+}
+
+impl<T: redis::IntoConnectionInfo> Config<T> {
+    pub fn with_defaults(addrs: Vec<T>) -> Self {
+        Self {
+            addrs,
             retry_count: 10,
             retry_delay: Duration::from_millis(400),
             retry_jitter: 400,
@@ -73,26 +82,26 @@ pub struct Redlock {
 }
 
 impl Redlock {
-    // Create a new redlock instance.
+    // Create a new Redlock instance.
     pub fn new<T: redis::IntoConnectionInfo>(config: Config<T>) -> RedlockResult<Redlock> {
         if config.addrs.is_empty() {
-            return Err(RedlockError::NoServerError);
+            return Err(RedlockError::NoServer);
         }
         let mut clients = Vec::with_capacity(config.addrs.len());
         for addr in config.addrs {
-            clients.push(redis::Client::open(addr)?)
+            clients.push(redis::Client::open(addr).context(RedisConnection)?)
         }
 
         let quorum = (clients.len() as f64 / 2_f64).floor() as usize + 1;
 
         Ok(Redlock {
-               clients,
-               retry_count: config.retry_count,
-               retry_delay: config.retry_delay,
-               retry_jitter: config.retry_jitter,
-               drift_factor: config.drift_factor,
-               quorum,
-           })
+            clients,
+            retry_count: config.retry_count,
+            retry_delay: config.retry_delay,
+            retry_jitter: config.retry_jitter,
+            drift_factor: config.drift_factor,
+            quorum,
+        })
     }
 
     // Locks the given resource using the Redlock algorithm.
@@ -101,21 +110,25 @@ impl Redlock {
     }
 
     fn extend(&self, resource_name: &str, value: &str, ttl: Duration) -> RedlockResult<Lock> {
-        self.request(RequestInfo::Extend { resource_value: value },
-                     resource_name,
-                     ttl)
+        self.request(
+            RequestInfo::Extend {
+                resource_value: value,
+            },
+            resource_name,
+            ttl,
+        )
     }
 
-    fn request(&self,
-               info: RequestInfo,
-               resource_name: &str,
-               ttl: Duration)
-               -> RedlockResult<(Lock)> {
+    fn request(
+        &self,
+        info: RequestInfo,
+        resource_name: &str,
+        ttl: Duration,
+    ) -> RedlockResult<(Lock)> {
         let mut attempts = 0;
-        let drift = Duration::from_millis((self.drift_factor as f64 *
-                                           util::num_milliseconds(&ttl) as f64)
-                                                  .round() as
-                                          u64 + 2);
+        let drift = Duration::from_millis(
+            (self.drift_factor as f64 * util::num_milliseconds(&ttl) as f64).round() as u64 + 2,
+        );
 
         'attempts: while attempts < self.retry_count {
             attempts += 1;
@@ -156,13 +169,15 @@ impl Redlock {
                         if waitings > 0 {
                             continue;
                         }
-                        // suceess: aquire the lock
+                        // success: acquire the lock
                         if votes >= self.quorum && lock.expiration > SystemTime::now() {
                             return Ok(lock);
                         }
 
-                        // fail: releases all aquired locks and retry
-                        lock.unlock().is_ok(); // Just ingore the result
+                        // fail: releases all acquired locks and retry
+                        if let Err(unlock_error) = lock.unlock() {
+                            eprintln!("Error unlocking RedLock: {:?} (Ignoring it)", unlock_error);
+                        }
                         thread::sleep(self.get_retry_timeout());
                         continue 'attempts;
                     }
@@ -171,7 +186,12 @@ impl Redlock {
                         // This attempt is doomed to fail, will retry after
                         // the timeout
                         if errors > self.quorum {
-                            lock.unlock().is_ok(); // Just ingore the result
+                            if let Err(unlock_error) = lock.unlock() {
+                                eprintln!(
+                                    "Error unlocking RedLock: {:?} (Ignoring it)",
+                                    unlock_error
+                                );
+                            }
                             thread::sleep(self.get_retry_timeout());
                             continue 'attempts;
                         }
@@ -240,15 +260,19 @@ impl Redlock {
     }
 }
 
-fn lock(client: &redis::Client,
-        resource_name: &str,
-        value: &str,
-        ttl: &Duration)
-        -> RedlockResult<bool> {
-    match LOCK.key(String::from(resource_name))
-              .arg(String::from(value))
-              .arg(util::num_milliseconds(ttl))
-              .invoke::<Option<()>>(&client.get_connection()?)? {
+fn lock(
+    client: &redis::Client,
+    resource_name: &str,
+    value: &str,
+    ttl: &Duration,
+) -> RedlockResult<bool> {
+    match LOCK
+        .key(String::from(resource_name))
+        .arg(String::from(value))
+        .arg(util::num_milliseconds(ttl))
+        .invoke::<Option<()>>(&mut client.get_connection().context(RedisConnection)?)
+        .context(RedisScript)?
+    {
         Some(_) => Ok(true),
         _ => Ok(false),
     }
@@ -256,24 +280,29 @@ fn lock(client: &redis::Client,
 
 fn unlock(client: &redis::Client, resource_name: &str, value: &str) -> RedlockResult<bool> {
     match UNLOCK
-              .key(resource_name)
-              .arg(value)
-              .invoke::<i32>(&client.get_connection()?)? {
+        .key(resource_name)
+        .arg(value)
+        .invoke::<i32>(&mut client.get_connection().context(RedisConnection)?)
+        .context(RedisScript)?
+    {
         1 => Ok(true),
         _ => Ok(false),
     }
 }
 
-fn extend(client: &redis::Client,
-          resource_name: &str,
-          value: &str,
-          ttl: &Duration)
-          -> RedlockResult<bool> {
+fn extend(
+    client: &redis::Client,
+    resource_name: &str,
+    value: &str,
+    ttl: &Duration,
+) -> RedlockResult<bool> {
     match EXTEND
-              .key(resource_name)
-              .arg(value)
-              .arg(util::num_milliseconds(ttl))
-              .invoke::<i32>(&client.get_connection()?)? {
+        .key(resource_name)
+        .arg(value)
+        .arg(util::num_milliseconds(ttl))
+        .invoke::<i32>(&mut client.get_connection().context(RedisConnection)?)
+        .context(RedisScript)?
+    {
         1 => Ok(true),
         _ => Ok(false),
     }
@@ -281,6 +310,8 @@ fn extend(client: &redis::Client,
 
 #[cfg(test)]
 mod tests {
+    use lazy_static::lazy_static;
+
     use super::*;
     use redis::Commands;
 
@@ -291,8 +322,8 @@ mod tests {
             retry_delay: Duration::from_millis(400),
             retry_jitter: 400,
             drift_factor: 0.01,
-        }).unwrap();
-
+        })
+        .unwrap();
         static ref REDIS_CLI: redis::Client = redis::Client::open("redis://127.0.0.1").unwrap();
     }
 
@@ -310,13 +341,13 @@ mod tests {
     #[should_panic]
     fn test_new_with_no_server() {
         Redlock::new::<&str>(Config {
-                                 addrs: vec![],
-                                 retry_count: 10,
-                                 retry_delay: Duration::from_millis(400),
-                                 retry_jitter: 400,
-                                 drift_factor: 0.01,
-                             })
-                .unwrap();
+            addrs: vec![],
+            retry_count: 10,
+            retry_delay: Duration::from_millis(400),
+            retry_jitter: 400,
+            drift_factor: 0.01,
+        })
+        .unwrap();
     }
 
     #[test]

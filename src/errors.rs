@@ -1,18 +1,36 @@
-use std::time;
-use redis;
+use std::time::SystemTimeError;
+
+use redis::RedisError;
+use snafu::Snafu;
+
+pub use snafu::ResultExt;
 
 pub type RedlockResult<T> = Result<T, RedlockError>;
 
-quick_error!{
-  #[derive(Debug)]
-  pub enum RedlockError {
-    RedisError(err: redis::RedisError) { from(err: redis::RedisError) -> (err) }
-    TimeError(err: time::SystemTimeError) { from(err: time::SystemTimeError) -> (err) }
-    NoServerError { description("Redlock must be initialized with at least one redis server") }
-    TimeoutError { description("Redlock request timeout") }
-    LockExpired { description("The lock has already expired") }
-    UnableToLock { description("Unable to lock the resource") }
-    UnableToUnlock { description("Unable to unlock the resource") }
-    UnableToExtend { description("Unable to extend the resource") }
-  }
+#[derive(Debug, Snafu)]
+#[snafu(visibility = "pub(crate)")] // Default
+pub enum RedlockError {
+    #[snafu(display("Redis connection error: {:?}", source))]
+    RedisConnection {
+        source: RedisError,
+    },
+    #[snafu(display("Redis script error: {:?}", source))]
+    RedisScript {
+        source: RedisError,
+    },
+    TimeErr {
+        source: SystemTimeError,
+    },
+    #[snafu(display("Redlock must be initialized with at least one redis server"))]
+    NoServer,
+    #[snafu(display("Redlock request timeout"))]
+    Timeout,
+    #[snafu(display("The lock has already expired"))]
+    LockExpired,
+    #[snafu(display("Unable to lock the resource"))]
+    UnableToLock,
+    #[snafu(display("Unable to unlock the resource"))]
+    UnableToUnlock,
+    #[snafu(display("Unable to extend the resource"))]
+    UnableToExtend,
 }
